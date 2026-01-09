@@ -28,7 +28,7 @@ struct kmem_cache;
 struct page {
     uint32_t flags;
 
-    // 用于链表管理的通用指针 (Buddy用它连空闲页，Slab用它连Partial页)
+    // 用于链表管理的通用指针 (Buddy用它连空闲页，Slab用连Partial页)
     // 把它移出 Union，避免覆盖关键数据
     struct page *next;
 
@@ -163,13 +163,14 @@ void slab_init() {
 }
 
 int cache_grow(kmem_cache_t *cache) {
+    // 从buddy找一个最小页
     struct page *page = alloc_pages(0);
     if (!page) return 0;
 
     page->flags = PG_slab;
     page->slab_cache = cache;
     page->active_objects = 0;
-
+    // 用页帧计算出真实的内存偏移（PA）
     void *addr = page_address(page);
     void **prev_obj_ptr = NULL;
 
@@ -184,7 +185,7 @@ int cache_grow(kmem_cache_t *cache) {
 
     page->freelist = prev_obj_ptr;
 
-    // [FIX] 这里现在安全了，因为 next 和 freelist 是独立的字段
+    // 头插法 newPage->old_page
     page->next = cache->partial;
     cache->partial = page;
 
@@ -192,20 +193,22 @@ int cache_grow(kmem_cache_t *cache) {
 }
 
 void *kmem_cache_alloc(kmem_cache_t *cache) {
+    // 看当前内存池里面有没有
     if (!cache->partial) {
+        // 没有的话分配
         if (!cache_grow(cache)) return NULL;
     }
 
     struct page *page = cache->partial;
 
-    // [DEBUG] 简单的空指针检查
+    // 简单的空指针检查
     if (!page->freelist) {
         printf("Error: Page inside partial list has NULL freelist!\n");
         return NULL;
     }
-
+    // obj是要取的PA，更新freelist，指向原来放在obj里面的PA
     void *obj = page->freelist;
-    page->freelist = *(void **)obj; // 这里的解引用在之前版本会导致崩溃
+    page->freelist = *(void **)obj;
     page->active_objects++;
 
     if (!page->freelist) {
@@ -223,16 +226,20 @@ void kmem_cache_free(void *obj) {
 
     kmem_cache_t *cache = page->slab_cache;
 
+    // 把释放的位置写上freelist（原来下一个空闲的位置）
     *(void **)obj = page->freelist;
     page->freelist = obj;
     page->active_objects--;
 
+    // 本来如果满了该page会变成游离状态（节省CPU资源）
+    // 如果没满可以放回来
     int max_objs = PAGE_SIZE / cache->obj_size;
     if (page->active_objects == max_objs - 1) {
         page->next = cache->partial;
         cache->partial = page;
     }
 
+    // 如果本页无活跃还给buddy
     if (page->active_objects == 0) {
         if (cache->partial == page) {
             cache->partial = page->next;
@@ -271,14 +278,15 @@ void kmalloc_init() {
 }
 
 void *kmalloc(size_t size) {
-    // Slab path
+    // slub
     for (int i = 0; i < SLAB_INDEX_COUNT; i++) {
         if (size <= slab_sizes[i]) {
+            // 寻找现在的内存池里面有没有空位
             return kmem_cache_alloc(&slab_caches[i]);
         }
     }
 
-    // Buddy path
+    // Buddy
     int order = 0;
     while ((PAGE_SIZE << order) < size) order++;
 
